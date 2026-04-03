@@ -230,11 +230,13 @@ class MedicalModel:
         # Decode only newly generated tokens (not the input prompt)
         new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
         result = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-        # Strip garbage markdown code blocks and extra whitespace
+        # Strip garbage markdown code blocks
         result = result.replace("```", "").strip()
-        # Take only first clean paragraph (stops at repeated newlines)
-        lines = [l for l in result.split("\n") if l.strip()]
-        return " ".join(lines[:6]).strip()  # max 6 lines of response
+        # Stop at fake dialogue — model sometimes hallucinates User:/Assistant: turns
+        for stop in ["\nUser:", "\nAssistant:", "User:", "\n\nUser"]:
+            if stop in result:
+                result = result.split(stop)[0].strip()
+        return result
 
     # ========================================================================
     # Internal helper: classifies the user's message into LEVEL1, LEVEL2, or LEVEL3.
