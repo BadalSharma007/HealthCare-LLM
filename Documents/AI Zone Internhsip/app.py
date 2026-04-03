@@ -220,9 +220,21 @@ class MedicalModel:
     def _run_model(self, system_prompt: str, user_message: str, max_tokens: int = 250) -> str:
         full_prompt = f"<system>{system_prompt}</system>\nUser: {user_message}\nAssistant:"
         inputs = self.tokenizer(full_prompt, return_tensors="pt").to("cuda")
-        outputs = self.model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
-        result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return result.split("Assistant:")[-1].strip()
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+        # Decode only newly generated tokens (not the input prompt)
+        new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+        result = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        # Strip garbage markdown code blocks and extra whitespace
+        result = result.replace("```", "").strip()
+        # Take only first clean paragraph (stops at repeated newlines)
+        lines = [l for l in result.split("\n") if l.strip()]
+        return " ".join(lines[:6]).strip()  # max 6 lines of response
 
     # ========================================================================
     # Internal helper: classifies the user's message into LEVEL1, LEVEL2, or LEVEL3.
