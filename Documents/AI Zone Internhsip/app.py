@@ -131,15 +131,21 @@ The user has a serious or emergency health concern.
 # The model is asked to respond with only LEVEL1, LEVEL2, or LEVEL3.
 # This classification then decides which system prompt and response style to use.
 # ============================================================================
-SEVERITY_DETECT_PROMPT = """You are a medical severity classifier.
-Given the user's health message, respond with ONLY one of: LEVEL1, LEVEL2, or LEVEL3.
+SEVERITY_DETECT_PROMPT = """Classify the severity of this health message. Reply with ONLY one word.
 
-LEVEL1 = Mild / general concern (cold, mild headache, tiredness, minor issue)
-LEVEL2 = Moderate concern (ongoing pain, recurring symptoms, needs doctor visit)
-LEVEL3 = Serious / emergency (severe chest pain, difficulty breathing, stroke signs, high fever in child, uncontrolled bleeding, suicidal thoughts)
+Examples:
+"I have a mild headache" -> LEVEL1
+"I feel a bit tired" -> LEVEL1
+"I have cold and runny nose" -> LEVEL1
+"I have back pain for 2 weeks" -> LEVEL2
+"I have recurring fever for 3 days" -> LEVEL2
+"I feel dizzy when I stand up" -> LEVEL2
+"I have crushing chest pain" -> LEVEL3
+"I can't breathe" -> LEVEL3
+"My left arm is numb and chest hurts" -> LEVEL3
 
-User message: "{prompt}"
-Severity:"""
+Message: "{prompt}"
+Answer (LEVEL1 or LEVEL2 or LEVEL3):"""
 
 # ============================================================================
 # List of non-medical / personal questions to block.
@@ -159,9 +165,10 @@ PERSONAL_KEYWORDS = ["your name", "who are you", "are you human", "do you feel",
     gpu="A10G",
     secrets=[
         modal.Secret.from_name("huggingface-secret"),  # HF_TOKEN
-        modal.Secret.from_name("aws-secret"),           # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, DYNAMODB_TABLE_NAME etc.
+        modal.Secret.from_name("aws-secret"),          # AWS S3 + DynamoDB credentials
     ],
     max_containers=100,
+    min_containers=1,  # keeps 1 container always alive on A10G — no cold start, instant response
 )
 @modal.concurrent(max_inputs=10)
 class MedicalModel:
@@ -225,8 +232,10 @@ class MedicalModel:
     def _detect_severity(self, prompt: str) -> str:
         classify_prompt = SEVERITY_DETECT_PROMPT.format(prompt=prompt)
         inputs = self.tokenizer(classify_prompt, return_tensors="pt").to("cuda")
-        outputs = self.model.generate(**inputs, max_new_tokens=5, do_sample=False)
-        raw = self.tokenizer.decode(outputs[0], skip_special_tokens=True).upper()
+        outputs = self.model.generate(**inputs, max_new_tokens=10, do_sample=False)
+        # Decode only the newly generated tokens (not the full prompt)
+        new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+        raw = self.tokenizer.decode(new_tokens, skip_special_tokens=True).upper().strip()
         if "LEVEL3" in raw:
             return "LEVEL3"
         elif "LEVEL2" in raw:
