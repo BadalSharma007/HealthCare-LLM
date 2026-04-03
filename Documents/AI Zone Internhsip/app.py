@@ -14,12 +14,20 @@ app = modal.App("medgemma-medical")
 # accelerate (multi-GPU support), bitsandbytes (4-bit quantization).
 # This image is built once and cached on Modal's servers.
 # ============================================================================
-image = modal.Image.debian_slim(python_version="3.11").pip_install(
-    "torch",
-    "transformers",
-    "accelerate",
-    "bitsandbytes",
-    "fastapi[standard]",
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "torch",
+        "transformers",
+        "accelerate",
+        "bitsandbytes",
+        "fastapi[standard]",
+        "boto3",          # AWS SDK — needed for S3 and DynamoDB
+    )
+    .add_local_file(      # copies storage_handler.py into the Modal container
+        local_path="storage_handler.py",
+        remote_path="/root/storage_handler.py"
+    )
 )
 
 # ============================================================================
@@ -149,7 +157,10 @@ PERSONAL_KEYWORDS = ["your name", "who are you", "are you human", "do you feel",
 @app.cls(
     image=image,
     gpu="A10G",
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),  # HF_TOKEN
+        modal.Secret.from_name("aws-secret"),           # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, DYNAMODB_TABLE_NAME etc.
+    ],
     max_containers=100,
 )
 @modal.concurrent(max_inputs=10)
@@ -164,7 +175,7 @@ class MedicalModel:
     # ========================================================================
     @modal.enter()
     def load_model(self):
-        import torch, os
+        import torch, os, sys
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
         token = os.environ["HF_TOKEN"]
@@ -184,6 +195,15 @@ class MedicalModel:
             device_map="auto",
             token=token
         )
+
+        # Import storage handler from the file we copied into the container
+        sys.path.insert(0, "/root")
+        from storage_handler import (
+            store_output_to_dynamodb,
+            store_output_log_to_s3,
+        )
+        self.store_dynamodb = store_output_to_dynamodb
+        self.store_s3       = store_output_log_to_s3
 
     # ========================================================================
     # Internal helper: builds the full prompt, runs the model, and returns
@@ -283,6 +303,41 @@ class MedicalModel:
         sessions[user_id] = {"count": new_count}
         session_ended = new_count >= MAX_CHATS_PER_SESSION
 
+        # ----------------------------------------------------------------
+        # Build the DynamoDB / S3 record.
+        # Structure matches the agreed schema:
+        #   chats → dict of query_N keys (DynamoDB format)
+        #   S3 log → auto-converted to list by store_output_log_to_s3()
+        # We fetch the existing record from sessions store to accumulate
+        # all queries of this chat session into one record.
+        # ----------------------------------------------------------------
+        chat_id  = f"chat_{user_id}"
+        session_data = sessions.get(f"{user_id}_record", {"chats": {}})
+
+        query_key = f"query_{new_count}"
+        session_data["chats"][query_key] = {
+            "input":  {"query_text": message},
+            "output": {"text": response}
+        }
+
+        record = {
+            "user_id":            user_id,
+            "chat_id":            chat_id,
+            "chats":              session_data["chats"],
+            "severity":           severity.lower(),
+            "doctor_specialist":  specialist,
+            "recommended_action": "consult immediately" if severity == "LEVEL3" else "see a specialist" if severity == "LEVEL2" else "monitor symptoms",
+            "timestamp":          __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "language":           "en",
+        }
+
+        # Save accumulated record back to session store for next query
+        sessions[f"{user_id}_record"] = session_data
+
+        # Save to DynamoDB (primary DB) then S3 (backup log)
+        self.store_dynamodb(record)
+        self.store_s3(record)
+
         return {
             "response": response,
             "level": severity,
@@ -299,6 +354,7 @@ class MedicalModel:
     @modal.method()
     def reset_session(self, user_id: str) -> dict:
         sessions[user_id] = {"count": 0}
+        sessions[f"{user_id}_record"] = {"chats": {}}  # clear accumulated chat record
         return {"status": "Session reset", "user_id": user_id}
 
     # ========================================================================
