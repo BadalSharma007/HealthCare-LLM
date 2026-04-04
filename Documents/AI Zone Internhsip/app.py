@@ -105,26 +105,48 @@ def detect_specialist(text: str) -> str:
 # LEVEL_2_PROMPT  → Moderate issues: ask questions + recommend specialist
 # LEVEL_3_PROMPT  → Emergency/SOS: skip advice, direct to hospital immediately
 # ============================================================================
-LEVEL_1_PROMPT = """You are a friendly medical information assistant for Level 1 (mild concern).
-The user has a general/mild health question.
-- Give practical general health advice (rest, hydration, lifestyle tips).
-- Do NOT prescribe any medicines or treatments.
-- Keep it warm, simple and concise (2-3 sentences max).
-- End by noting: if it persists, they should see a doctor."""
+LEVEL_1_PROMPT = """You are a medical information assistant. Reply in EXACTLY this format, nothing else:
 
-LEVEL_2_PROMPT = """You are a medical triage assistant for Level 2 (moderate concern).
-The user has a moderate health concern.
-- Ask 1-2 short clarifying questions to understand severity better (duration, location, intensity).
-- Give general precautionary advice only (not prescriptions).
-- Clearly recommend they consult a specific specialist (will be provided).
-- Keep response concise."""
+Instruction: [one sentence telling the user what to do first]
+General Advice: [2-3 practical tips like rest, hydration, lifestyle — NO medicines]
+Consult: [{specialist}]
+Keywords: [3-4 medical keywords from the user's complaint]
+Follow-up Q1: [ask about duration — how long have they had this?]
+Follow-up Q2: [ask about intensity — how severe is it on a scale?]"""
 
-LEVEL_3_PROMPT = """You are an emergency medical assistant for Level 3 (serious/SOS).
-The user has a serious or emergency health concern.
-- Immediately tell them this is serious and they need urgent medical attention.
-- Do NOT give advice — direct them to go to a hospital or call emergency services NOW.
-- Be calm but very clear and urgent.
-- One short sentence of what to do while waiting for help (if safe to give)."""
+LEVEL_2_PROMPT = """You are a medical triage assistant. Reply in EXACTLY this format, nothing else:
+
+Instruction: [one sentence — this needs attention, take it seriously]
+General Advice: [2-3 precautionary tips — NO medicines or prescriptions]
+Consult: [{specialist}]
+Keywords: [3-4 medical keywords from the user's complaint]
+Follow-up Q1: [ask about exact location of pain/symptom]
+Follow-up Q2: [ask if symptoms are getting worse over time]"""
+
+LEVEL_3_PROMPT = """You are an emergency medical assistant. Reply in EXACTLY this format, nothing else:
+
+Instruction: [URGENT — go to hospital or call emergency services NOW]
+General Advice: [one safe thing to do while waiting for help]
+Consult: [{specialist}]
+Keywords: [3-4 emergency medical keywords from the complaint]
+Follow-up Q1: [ask if they are alone or someone is with them]
+Follow-up Q2: [ask if symptoms started suddenly or gradually]"""
+
+# ============================================================================
+# 2nd chat prompt — uses keywords from 1st chat to give focused advice.
+# Context-aware: knows what the user already said in chat 1.
+# ============================================================================
+FOLLOWUP_PROMPT = """You are a medical assistant doing a follow-up.
+The user's previous keywords were: {keywords}
+Their answer to follow-up questions is: {message}
+
+Reply in EXACTLY this format:
+Instruction: [updated advice based on their answer]
+General Advice: [more specific tips based on new information]
+Consult: [{specialist}]
+Keywords: [updated keywords including new information]
+Follow-up Q1: [one more specific clarifying question]
+Follow-up Q2: [ask about any other symptoms they may have]"""
 
 # ============================================================================
 # This prompt is used to classify the severity of the user's message.
@@ -168,7 +190,7 @@ PERSONAL_KEYWORDS = ["your name", "who are you", "are you human", "do you feel",
         modal.Secret.from_name("aws-secret"),          # AWS S3 + DynamoDB credentials
     ],
     max_containers=100,
-    min_containers=1,  # keeps 1 container always alive on A10G — no cold start, instant response
+    # min_containers=1,  # uncomment this only when demoing — costs $1.10/hr on A10G
 )
 @modal.concurrent(max_inputs=10)
 class MedicalModel:
@@ -301,19 +323,37 @@ class MedicalModel:
         severity = self._detect_severity(message)
         specialist = detect_specialist(message)
 
-        # Generate response — behaviour changes based on severity level
-        if severity == "LEVEL1":
-            # Mild: give general lifestyle/health tips, no prescriptions
-            response = self._run_model(LEVEL_1_PROMPT, message)
+        # Get previous session keywords for follow-up context (2nd and 3rd chat)
+        prev_data = sessions.get(f"{user_id}_record", {"chats": {}, "keywords": ""})
+        prev_keywords = prev_data.get("keywords", "")
 
-        elif severity == "LEVEL2":
-            # Moderate: ask clarifying questions + recommend specialist
-            system = LEVEL_2_PROMPT + f"\nRecommend they see a: {specialist}"
+        # Generate response — 1st chat uses severity prompts, 2nd+ uses follow-up prompt
+        if count == 0:
+            # First chat — use severity-based prompt with specialist injected
+            if severity == "LEVEL1":
+                system = LEVEL_1_PROMPT.replace("{specialist}", specialist)
+            elif severity == "LEVEL2":
+                system = LEVEL_2_PROMPT.replace("{specialist}", specialist)
+            else:
+                system = LEVEL_3_PROMPT.replace("{specialist}", specialist)
             response = self._run_model(system, message)
 
         else:
-            # SOS/Emergency: skip advice, direct to hospital + emergency number
-            response = self._run_model(LEVEL_3_PROMPT, message)
+            # 2nd or 3rd chat — use follow-up prompt with previous keywords as context
+            system = FOLLOWUP_PROMPT.replace("{keywords}", prev_keywords or "not available") \
+                                    .replace("{specialist}", specialist) \
+                                    .replace("{message}", message)
+            response = self._run_model(system, message)
+
+        # Extract keywords from response to store for next follow-up
+        keywords = ""
+        for line in response.split("\n"):
+            if line.strip().startswith("Keywords:"):
+                keywords = line.replace("Keywords:", "").strip()
+                break
+
+        # Add emergency banner for LEVEL3
+        if severity == "LEVEL3":
             response += (
                 f"\n\n🚨 EMERGENCY: Please call 112 (India) / 911 (US) immediately "
                 f"or go to the nearest hospital. Ask for a {specialist}."
@@ -335,7 +375,8 @@ class MedicalModel:
         # all queries of this chat session into one record.
         # ----------------------------------------------------------------
         chat_id  = f"chat_{user_id}"
-        session_data = sessions.get(f"{user_id}_record", {"chats": {}})
+        session_data = sessions.get(f"{user_id}_record", {"chats": {}, "keywords": ""})
+        session_data["keywords"] = keywords  # save keywords for next follow-up chat
 
         query_key = f"query_{new_count}"
         session_data["chats"][query_key] = {
@@ -377,7 +418,7 @@ class MedicalModel:
     @modal.method()
     def reset_session(self, user_id: str) -> dict:
         sessions[user_id] = {"count": 0}
-        sessions[f"{user_id}_record"] = {"chats": {}}  # clear accumulated chat record
+        sessions[f"{user_id}_record"] = {"chats": {}, "keywords": ""}  # clear chat record and keywords
         return {"status": "Session reset", "user_id": user_id}
 
     # ========================================================================
