@@ -107,46 +107,50 @@ def detect_specialist(text: str) -> str:
 # ============================================================================
 LEVEL_1_PROMPT = """You are a medical information assistant. Reply in EXACTLY this format, nothing else:
 
-Instruction: [one sentence telling the user what to do first]
-General Advice: [2-3 practical tips like rest, hydration, lifestyle — NO medicines]
-Consult: [{specialist}]
-Keywords: [3-4 medical keywords from the user's complaint]
-Follow-up Q1: [ask about duration — how long have they had this?]
-Follow-up Q2: [ask about intensity — how severe is it on a scale?]"""
+- {user_message}
+
+- Mild Concern
+- Instruction: [one sentence telling the user what to do first]
+- General Advice: [2-3 practical tips like rest, hydration, lifestyle — NO medicines]
+- Consult: [{specialist}]
+- Keywords: [3-4 medical keywords from the complaint]
+- Q1: [ask about duration — how long have they had this?]
+- Q2: [ask about intensity — how severe is it on a scale of 1-10?]"""
 
 LEVEL_2_PROMPT = """You are a medical triage assistant. Reply in EXACTLY this format, nothing else:
 
-Instruction: [one sentence — this needs attention, take it seriously]
-General Advice: [2-3 precautionary tips — NO medicines or prescriptions]
-Consult: [{specialist}]
-Keywords: [3-4 medical keywords from the user's complaint]
-Follow-up Q1: [ask about exact location of pain/symptom]
-Follow-up Q2: [ask if symptoms are getting worse over time]"""
+- {user_message}
+
+- Moderate Concern
+- Instruction: [one sentence — this needs medical attention soon]
+- General Advice: [2-3 precautionary tips — NO medicines or prescriptions]
+- Consult: [{specialist}]
+- Keywords: [3-4 medical keywords from the complaint]
+- Q1: [ask about exact location of the pain/symptom]
+- Q2: [ask if symptoms are getting worse over time]"""
 
 LEVEL_3_PROMPT = """You are an emergency medical assistant. Reply in EXACTLY this format, nothing else:
 
-Instruction: [URGENT — go to hospital or call emergency services NOW]
-General Advice: [one safe thing to do while waiting for help]
-Consult: [{specialist}]
-Keywords: [3-4 emergency medical keywords from the complaint]
-Follow-up Q1: [ask if they are alone or someone is with them]
-Follow-up Q2: [ask if symptoms started suddenly or gradually]"""
+- {user_message}
+
+- EMERGENCY
+- Instruction: [URGENT — go to hospital or call emergency services NOW]
+- General Advice: [one safe action to take while waiting for help]
+- Consult: [{specialist}]
+- Keywords: [3-4 emergency medical keywords from the complaint]
+- Q1: [ask if they are alone or someone is with them]
+- Q2: [ask if symptoms started suddenly or gradually]"""
 
 # ============================================================================
-# 2nd chat prompt — uses keywords from 1st chat to give focused advice.
-# Context-aware: knows what the user already said in chat 1.
+# 2nd chat prompt — uses keywords from 1st chat + user's answers.
+# Output format: keyword context → focused doctor + advice only.
 # ============================================================================
 FOLLOWUP_PROMPT = """You are a medical assistant doing a follow-up.
 The user's previous keywords were: {keywords}
-Their answer to follow-up questions is: {message}
 
-Reply in EXACTLY this format:
-Instruction: [updated advice based on their answer]
-General Advice: [more specific tips based on new information]
-Consult: [{specialist}]
-Keywords: [updated keywords including new information]
-Follow-up Q1: [one more specific clarifying question]
-Follow-up Q2: [ask about any other symptoms they may have]"""
+Reply in EXACTLY this format, nothing else:
+
+- {keywords}: {specialist} + [specific advice based on keywords and user's new message]"""
 
 # ============================================================================
 # This prompt is used to classify the severity of the user's message.
@@ -331,11 +335,11 @@ class MedicalModel:
         if count == 0:
             # First chat — use severity-based prompt with specialist injected
             if severity == "LEVEL1":
-                system = LEVEL_1_PROMPT.replace("{specialist}", specialist)
+                system = LEVEL_1_PROMPT.replace("{specialist}", specialist).replace("{user_message}", message)
             elif severity == "LEVEL2":
-                system = LEVEL_2_PROMPT.replace("{specialist}", specialist)
+                system = LEVEL_2_PROMPT.replace("{specialist}", specialist).replace("{user_message}", message)
             else:
-                system = LEVEL_3_PROMPT.replace("{specialist}", specialist)
+                system = LEVEL_3_PROMPT.replace("{specialist}", specialist).replace("{user_message}", message)
             response = self._run_model(system, message)
 
         else:
